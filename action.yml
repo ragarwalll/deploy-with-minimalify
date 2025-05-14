@@ -1,0 +1,159 @@
+name: "Deploy to GH-Pages using Minimalify"
+branding:
+  icon: "thumbs-up"
+  color: "white"
+description: |
+  Deploys a static site to GitHub Pages using Minimalify.
+author: "ragarwalll"
+inputs:
+  package-manager:
+    description: "npm | yarn | pnpm | bun | deno"
+    required: false
+    default: "npm"
+  node-version:
+    description: "Node.js version (ignored for deno)"
+    required: false
+    default: "20"
+  cache-deps:
+    description: "Cache dependencies?"
+    required: false
+    default: "true"
+  precheck:
+    description: "Run lint & format?"
+    required: false
+    default: "true"
+  workdir:
+    description: "Working directory (where package.json / config live)"
+    required: false
+    default: "."
+  branch:
+    description: "Target branch to push the build to"
+    required: false
+    default: "gh-pages"
+  config-file:
+    description: "Path to config file (JSON or JS) exporting { outDir }"
+    required: false
+    default: "minimalify.config.json"
+  github-token:
+    description: "GitHub token with repo permissions"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+
+    - name: Checkout source
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    - name: Setup Node.js (npm/yarn/pnpm/bun)
+      if: ${{ inputs.package-manager != 'deno' }}
+      uses: actions/setup-node@v3
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Setup Deno
+      if: ${{ inputs.package-manager == 'deno' }}
+      uses: denoland/setup-deno@v1
+      with:
+        deno-version: "latest"
+
+    - name: Cache dependencies
+      if: ${{ inputs.cache-deps == 'true' && inputs.package-manager != 'deno' }}
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.npm
+          ~/.cache/yarn
+          ~/.pnpm-store
+          ~/.bun/install
+        key: ${{ runner.os }}-deps-${{ inputs.package-manager }}-${{ hashFiles('**/package-lock.json','**/yarn.lock','**/pnpm-lock.yaml') }}
+
+    - name: Install dependencies
+      working-directory: ${{ inputs.workdir }}
+      shell: bash
+      run: |
+        case "${{ inputs.package-manager }}" in
+          npm)  npm ci ;;
+          yarn) yarn --frozen-lockfile ;;
+          pnpm) pnpm install --frozen-lockfile ;;
+          bun)  bun install ;;
+          deno) deno cache . ;;
+        esac
+
+    - name: Precheck - lint & format
+      if: ${{ inputs.precheck == 'true' }}
+      working-directory: ${{ inputs.workdir }}
+      shell: bash
+      run: |
+        if [ "${{ inputs.package-manager }}" = "deno" ]; then
+          deno lint && deno fmt --check
+        else
+          PM=${{ inputs.package-manager }}
+          $PM run lint || echo "no lint script"
+          $PM run format:check || $PM run format || echo "no format script"
+        fi
+
+    - name: Build
+      working-directory: ${{ inputs.workdir }}
+      shell: bash
+      run: |
+        if [ "${{ inputs.package-manager }}" = "deno" ]; then
+          deno run --allow-read --allow-write build.ts
+        else
+          ${{ inputs.package-manager }} run build
+        fi
+
+    - name: Read outDir from config (JSON or JS)
+      id: getdir
+      working-directory: ${{ inputs.workdir }}
+      shell: bash
+      run: |
+        CONF_PATH="${{ inputs.workdir }}/${{ inputs.config-file }}"
+        DEFAULT="dist"
+        EXT="${CONF_PATH##*.}"
+
+        if [ "$EXT" = "js" ]; then
+          OUTDIR=$(node -e '
+            const path = require("path");
+            const cfg = require(path.resolve(process.cwd(), "'"$CONF_PATH"'"));
+            process.stdout.write(cfg.outDir || "'"$DEFAULT"'");
+          ')
+        else
+          if [ -f "$CONF_PATH" ]; then
+            OUTDIR=$(jq -r '.outDir // empty' "$CONF_PATH")
+            OUTDIR=${OUTDIR:-$DEFAULT}
+          else
+            OUTDIR=$DEFAULT
+          fi
+        fi
+
+        echo "Using outputDir: $OUTDIR"
+        echo "::set-output name=dir::$OUTDIR"
+
+    - name: Deploy to branch
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      shell: bash
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        TARGET=${{ inputs.branch }}
+        REPO="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+        git clone --branch "$TARGET" "$REPO" deploy \
+          || (
+               git clone "$REPO" deploy &&
+               cd deploy &&
+               git checkout --orphan "$TARGET" &&
+               git rm -rf . &&
+               git commit --allow-empty -m "init $TARGET" &&
+               git push -u origin "$TARGET" &&
+               cd ..
+             )
+        rm -rf deploy/*
+        cp -R "${{ inputs.workdir }}/${{ steps.getdir.outputs.dir }}/"* deploy/
+        cd deploy
+        git add .
+        git commit -m "chore(minimalify): deploy to $TARGET [skip ci]" || echo "no changes"
+        git push origin "$TARGET"
